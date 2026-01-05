@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
+import uuid
 
 class ModifiedSentence(BaseModel):
     output: str
@@ -65,7 +66,33 @@ def get_client():
 def upload_to_gemini(path: str, client):
     """Uploads a file to Gemini and waits for it to be processed."""
     print(f"Uploading file: {path}...")
-    file = client.files.upload(file=path)
+    
+    # Handle non-ASCII filenames by creating a temporary ASCII symlink
+    # buffer for upload, as some libraries struggle with non-ASCII paths in headers
+    upload_path = path
+    temp_link = None
+    
+    try:
+        path.encode('ascii')
+    except UnicodeEncodeError:
+        try:
+            ext = os.path.splitext(path)[1]
+            temp_link = f"temp_{uuid.uuid4().hex}{ext}"
+            # Create absolute path for symlink to ensure it points correctly
+            os.symlink(os.path.abspath(path), temp_link)
+            upload_path = temp_link
+        except Exception as e:
+            print(f"Warning: Failed to create temp symlink for non-ASCII filename: {e}")
+            # Fallback to original path and hope for the best
+            upload_path = path
+
+    try:
+        file = client.files.upload(file=upload_path)
+    finally:
+        # Clean up temp link immediately after upload request is sent/failed
+        if temp_link and os.path.exists(temp_link):
+            os.remove(temp_link)
+
     print(f"  Uploaded: {file.name}")
     
     # Wait for processing if it's a video or other large file
@@ -101,7 +128,7 @@ def prepare_gemini_context(srt_path: str, client):
             print(f"Video upload failed: {e}")
             
     # Aux Files
-    for ext in [".pptx", ".pdf", ".txt", ".md"]:
+    for ext in [".pdf", ".txt", ".md"]:
         aux_path = base_name + ext
         if os.path.exists(aux_path) and aux_path != srt_path:
             try:
@@ -125,7 +152,7 @@ def prepare_gemini_context(srt_path: str, client):
     
     try:
         response = client.models.generate_content(
-            model="gemini-3.0-pro-preview",
+                model="gemini-3-pro-preview",
             contents=contents,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -176,7 +203,7 @@ def ai_review_chunks(subtitles: List[srt.Subtitle], context_files: List[object],
         print(f"Reviewing chunk {i}-{i+len(chunk)}...", end="\r")
         try:
             response = client.models.generate_content(
-                model="gemini-3.0-pro-preview",
+                    model="gemini-3-flash-preview",
                 contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -207,6 +234,41 @@ def ai_review_chunks(subtitles: List[srt.Subtitle], context_files: List[object],
             
     print("\nChunk Review Complete.")
     return subtitles
+
+def process_single_subtitle(index: int, subtitles: List[srt.Subtitle], global_summary: str, client) -> Optional[ModifiedSentence]:
+    """
+    Process a single subtitle line using Gemini Flash.
+    """
+    sub = subtitles[index]
+    
+    # Context (Previous/Next)
+    prev_text = subtitles[index-1].content if index > 0 else ""
+    next_text = subtitles[index+1].content if index < len(subtitles) - 1 else ""
+    
+    prompt = f"""
+    Current Line ({index}): "{sub.content}"
+    Context Previous: "{prev_text}"
+    Context Next: "{next_text}"
+    """
+    
+    system_inst = SYSTEM_INSTRUCTION_TEMPLATE.format(
+        math_symbols=MATH_SYMBOLS,
+        global_summary=global_summary
+    )
+    
+    try:
+        response = client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=[system_inst, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ModifiedSentence,
+            ),
+        )
+        return ModifiedSentence.model_validate_json(response.text)
+    except Exception as e:
+        # print(f"Error line {index}: {e}")
+        return None
 
 def ai_refine_subtitles(srt_path: str, global_summary: str, context_files: list, client) -> str:
     """
