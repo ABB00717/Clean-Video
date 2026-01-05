@@ -1,165 +1,102 @@
+
 import os
 import sys
 import argparse
 from multiprocessing import Pool
+from core.cleaner import remove_video_silence
+from core.transcriber import generate_subtitles
+from core.editor import process_subtitles
 
-# Import the module functions
-from delete_blank import delete_video_blank
-from generate_srt import generate_srt
-from srt_modifier import modify_srt
-from delete_duplicate_string import delete_duplicate_string
-
-
-def clean_video(video_path, gap=1):
-    """Process a single video file through all steps.
+def process_single_video(video_path: str, gap_threshold: float = 1.0, language: str = "zh", initial_prompt: str = "這是一個繁體中文的句子"):
+    """
+    Runs the full pipeline on a single video file.
+    """
+    print(f"\n{'='*60}")
+    print(f"Processing: {os.path.basename(video_path)}")
+    print(f"{'='*60}\n")
     
-    Args:
-        video_path: Path to the video file
-        gap: Minimum silence duration (in seconds) to be removed in step 1
-    """
-    print(f"\n{'='*60}")
-    print(f"Processing: {video_path}")
-    print(f"{'='*60}\n")
-
     try:
-        # Step 1: file.mp4 -> file_trimmed.mp4
-        print("Step 1: Removing blank segments from video...")
-        trimmed_video = delete_video_blank(video_path, gap)
-        print(f"✓ Created: {trimmed_video}\n")
+        # Step 1: Remove Silence
+        print(">>> Step 1: Silence Removal")
+        trimmed_video = remove_video_silence(video_path, gap_threshold)
+        print(f"✓ Video trimmed: {trimmed_video}\n")
+        
+        # Step 2: Generate Subtitles
+        print(">>> Step 2: Transcription")
+        srt_file = generate_subtitles(trimmed_video, language=language, initial_prompt=initial_prompt)
+        print(f"✓ SRT generated: {srt_file}\n")
+        
+        # Step 3: Editor (AI Refinement + Deduplication)
+        print(">>> Step 3: Subtitle Refinement")
+        final_srt = process_subtitles(srt_file)
+        print(f"✓ SRT refined: {final_srt}\n")
+        
+        # Step 4: Finalize & Rename
+        print(">>> Step 4: Finalizing Files")
+        
+        # Original Video -> _orig.mp4
+        orig_backup = os.path.splitext(video_path)[0] + "_orig.mp4"
+        if not os.path.exists(orig_backup):
+            os.rename(video_path, orig_backup)
+            print(f"  Renamed original video to: {os.path.basename(orig_backup)}")
+            
+        # Trimmed Video -> Original Name
+        os.rename(trimmed_video, video_path)
+        print(f"  Renamed trimmed video to: {os.path.basename(video_path)}")
+        
+        # Refined SRT -> Original Name .srt
+        target_srt_name = os.path.splitext(video_path)[0] + ".srt"
+        if os.path.exists(target_srt_name):
+            os.remove(target_srt_name) # Remove existing if present to avoid conflict
+        os.rename(final_srt, target_srt_name)
+        print(f"  Renamed final SRT to: {os.path.basename(target_srt_name)}")
+        
+        # Cleanup intermediate SRT (the unrefined one)
+        unrefined_srt = os.path.splitext(trimmed_video)[0] + ".srt"
+        if os.path.exists(unrefined_srt) and unrefined_srt != final_srt:
+             os.remove(unrefined_srt)
+             print(f"  Removed intermediate SRT: {os.path.basename(unrefined_srt)}")
 
-        # Step 2: file_trimmed.mp4 -> file_trimmed.srt
-        print("Step 2: Generating SRT subtitle file...")
-        srt_file = generate_srt(trimmed_video)
-        print(f"✓ Created: {srt_file}\n")
-
-        # Rename original file to _orig.mp4
-        orig_name = video_path.rsplit(".", 1)[0] + "_orig.mp4"
-        if not os.path.exists(orig_name):
-            os.rename(video_path, orig_name)
-            print(f"✓ Renamed: {video_path} -> {orig_name}")
-
-        # Rename _trimmed.mp4 to original name
-        final_video = video_path
-        os.rename(trimmed_video, final_video)
-        print(f"✓ Renamed: {trimmed_video} -> {final_video}")
-
-        # Rename _trimmed_modified.srt to .srt
-        final_srt = video_path.replace("_trimmed_modified", "") 
-        final_srt = srt_file.replace("_trimmed", "") 
-        os.rename(srt_file, final_srt)
-        print(f"✓ Renamed: {srt_file} -> {final_srt}")
-
-        print(f"\n{'='*60}")
-        print(f"✓ Successfully processed: {video_path}")
-        print(f"{'='*60}\n")
-        return video_path
+        print(f"\n✓ Processing Complete for: {os.path.basename(video_path)}")
+        
     except Exception as e:
-        print(f"\n✗ Error processing {video_path}: {e}\n")
-        raise
-
-
-def process_video(video_path, gap=1):
-    """Process a single video file through all steps.
-
-    Args:
-        video_path: Path to the video file
-        gap: Minimum silence duration (in seconds) to be removed in step 1
-    """
-    print(f"\n{'='*60}")
-    print(f"Processing: {video_path}")
-    print(f"{'='*60}\n")
-
-    try:
-        # Step 1: file.mp4 -> file_trimmed.mp4
-        print(f"Step 1: Removing blank segments from video for {os.path.basename(video_path)}...")
-        trimmed_video = delete_video_blank(video_path, gap)
-        print(f"✓ Created: {os.path.basename(trimmed_video)} for {os.path.basename(video_path)}\n")
-
-        # Step 2: file_trimmed.mp4 -> file_trimmed.srt
-        print(f"Step 2: Generating SRT subtitle file for {os.path.basename(video_path)}...")
-        srt_file = generate_srt(trimmed_video)
-        print(f"✓ Created: {os.path.basename(srt_file)} for {os.path.basename(video_path)}\n")
-
-        # Step 3: file_trimmed.srt -> file_trimmed_modified.srt
-        print(f"Step 3: Modifying SRT with AI for {os.path.basename(video_path)}...")
-        modified_srt = modify_srt(srt_file)
-        print(f"✓ Created: {os.path.basename(modified_srt)} for {os.path.basename(video_path)}\n")
-
-        # Step 4: Remove duplicate strings in modified SRT
-        print(f"Step 4: Removing duplicate strings for {os.path.basename(video_path)}...")
-        delete_duplicate_string(modified_srt)
-        print(f"✓ Processed: {os.path.basename(modified_srt)} for {os.path.basename(video_path)}\n")
-
-        # Clean up temporary files
-        print(f"Cleaning up temporary files for {os.path.basename(video_path)}...")
-        # Delete the unmodified SRT file
-        if os.path.exists(srt_file):
-            os.remove(srt_file)
-            print(f"✓ Deleted: {os.path.basename(srt_file)}")
-
-        # Rename original file to _orig.mp4
-        orig_name = video_path.rsplit(".", 1)[0] + "_orig.mp4"
-        if not os.path.exists(orig_name):
-            os.rename(video_path, orig_name)
-            print(f"✓ Renamed: {os.path.basename(video_path)} -> {os.path.basename(orig_name)}")
-
-        # Rename _trimmed.mp4 to original name
-        final_video = video_path
-        os.rename(trimmed_video, final_video)
-        print(f"✓ Renamed: {os.path.basename(trimmed_video)} -> {os.path.basename(final_video)}")
-
-        # Rename _trimmed_modified.srt to .srt
-        final_srt = video_path.rsplit(".", 1)[0] + ".srt"
-        os.rename(modified_srt, final_srt)
-        print(f"✓ Renamed: {os.path.basename(modified_srt)} -> {os.path.basename(final_srt)}")
-
-        print(f"\n{'='*60}")
-        print(f"✓ Successfully processed: {os.path.basename(video_path)}")
-        print(f"{'='*60}\n")
-
-    except Exception as e:
-        print(f"\n✗ Error processing {video_path}: {e}\n")
-
+        print(f"\n✗ Error processing {video_path}: {e}")
+        # raise e # Optional: Raise if we want to stop batch processing
 
 def main():
-    parser = argparse.ArgumentParser(description="Process videos: remove blanks, generate and modify subtitles")
-    parser.add_argument("target_dir", type=str, help="Directory containing video files")
-    parser.add_argument("--gap", type=float, default=1, help="Minimum silence duration to remove (seconds)")
-
+    parser = argparse.ArgumentParser(description="Clean Video Tool: Silence Removal, Transcription, and Refinement.")
+    
+    parser.add_argument("input", type=str, help="Path to a video file OR a directory containing .mp4 files")
+    parser.add_argument("--gap", type=float, default=1.0, help="Minimum silence duration to remove (seconds)")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers for directory processing")
+    parser.add_argument("--language", type=str, default="zh", help="Language code for transcription (default: zh)")
+    parser.add_argument("--initial_prompt", type=str, default="這是一個繁體中文的句子", help="Initial prompt for context")
+    
     args = parser.parse_args()
-
-    # Check if target directory exists
-    if not os.path.isdir(args.target_dir):
-        print(f"Error: Directory '{args.target_dir}' not found")
+    
+    if os.path.isfile(args.input):
+        process_single_video(args.input, args.gap, args.language, args.initial_prompt)
+    elif os.path.isdir(args.input):
+        video_files = [
+            os.path.join(args.input, f) for f in os.listdir(args.input)
+            if f.lower().endswith('.mp4') and not f.endswith('_orig.mp4')
+        ]
+        
+        if not video_files:
+            print(f"No valid .mp4 files found in {args.input}")
+            return
+            
+        print(f"Found {len(video_files)} videos to process.")
+        
+        if args.workers > 1:
+            with Pool(processes=args.workers) as pool:
+                pool.starmap(process_single_video, [(v, args.gap, args.language, args.initial_prompt) for v in video_files])
+        else:
+            for v in video_files:
+                process_single_video(v, args.gap, args.language, args.initial_prompt)
+    else:
+        print(f"Error: Invalid input path: {args.input}")
         sys.exit(1)
-
-    # Find all .mp4 files in the target directory, excluding _orig.mp4 files
-    video_files = [os.path.join(args.target_dir, f) for f in os.listdir(args.target_dir) if
-                   f.endswith('.mp4') and not f.endswith('_orig.mp4')]
-
-    if not video_files:
-        print(f"No .mp4 files to process in '{args.target_dir}'")
-        sys.exit(0)
-
-    print(f"Found {len(video_files)} video file(s) to process")
-
-    # Create a pool of worker processes
-    # The number of processes will be the number of CPU cores by default
-    pool = Pool(processes=3)
-    try:
-        # Prepare arguments for each process
-        process_args = [(video_path, args.gap) for video_path in video_files]
-        # Process videos in parallel
-        pool.starmap(clean_video, process_args)
-    finally:
-        # Ensure pool is properly closed
-        pool.close()
-        pool.join()
-
-    print("\n" + "="*60)
-    print("All videos processed successfully!")
-    print("="*60)
-
 
 if __name__ == "__main__":
     main()

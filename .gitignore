@@ -1,0 +1,6 @@
+videos
+.env
+.venv
+SRTs
+.agent
+__pycache__
