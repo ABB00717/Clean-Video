@@ -23,6 +23,15 @@ class GlobalSummary(BaseModel):
     style_guide: str
 
 
+class ChunkCorrection(BaseModel):
+    index: int
+    content: str
+
+
+class ChunkReviewResponse(BaseModel):
+    corrections: List[ChunkCorrection]
+
+
 def load_math_symbols() -> str:
     """Loads math symbols from text file."""
     try:
@@ -134,7 +143,6 @@ def prepare_gemini_context(srt_path: str, client):
     video_path = base_name + ".mp4"
     if os.path.exists(video_path):
         try:
-            print(f"Uploading Video: {video_path}")
             context_files.append(upload_to_gemini(video_path, client))
         except Exception as e:
             print(f"Video upload failed: {e}")
@@ -144,7 +152,6 @@ def prepare_gemini_context(srt_path: str, client):
         aux_path = base_name + ext
         if os.path.exists(aux_path) and aux_path != srt_path:
             try:
-                print(f"Uploading Aux: {aux_path}")
                 context_files.append(upload_to_gemini(aux_path, client))
             except Exception as e:
                 print(f"Aux upload failed: {e}")
@@ -180,74 +187,81 @@ def prepare_gemini_context(srt_path: str, client):
         return "Topic: Mathematics.", context_files
 
 
+def process_chunk_review(
+    chunk_index: int, chunk: List[srt.Subtitle], context_files: List[object], client
+) -> List[ChunkCorrection]:
+    chunk_text = "\n".join([f"{sub.index}: {sub.content}" for sub in chunk])
+
+    prompt = f"""
+    Review the following subtitle chunk (Lines {chunk_index} to {chunk_index+len(chunk)}).
+    You have access to the VIDEO and AUXILIARY FILES.
+    
+    Task:
+    1. Check for any mismatches between the text and better visual context (blackboard, slides).
+    2. Ensure strict mathematical terminology consistency.
+    3. OUTPUT: A JSON list of ONLY the lines that need correction. If a line is correct, do not include it.
+    
+    Subtitles:
+    {chunk_text}
+    """
+
+    contents = context_files + [prompt]
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ChunkReviewResponse,
+            ),
+        )
+        data = ChunkReviewResponse.model_validate_json(response.text)
+        return data.corrections
+
+    except Exception as e:
+        print(f"  Chunk {chunk_index} review failed: {e}")
+        return []
+
+
 def ai_review_chunks(
     subtitles: List[srt.Subtitle], context_files: List[object], client
 ) -> List[srt.Subtitle]:
     """
-    Pass 2: Review subtitles in chunks of 100 using Gemini Pro + Video Context.
+    Pass 2: Review subtitles in chunks of 20 using Gemini Pro + Video Context.
     """
-    CHUNK_SIZE = 100
-    print(f"Starting Chunk Review (Gemini Pro) - {len(subtitles)} lines...")
+    CHUNK_SIZE = 20
+    print(f"Starting Chunk Review (Gemini Pro) - {len(subtitles)} lines (20 threads)...")
 
-    class ChunkCorrection(BaseModel):
-        index: int
-        content: str
-
-    class ChunkReviewResponse(BaseModel):
-        corrections: List[ChunkCorrection]
-
-    for i in range(0, len(subtitles), CHUNK_SIZE):
-        chunk = subtitles[i : i + CHUNK_SIZE]
-        chunk_text = "\n".join([f"{sub.index}: {sub.content}" for sub in chunk])
-
-        prompt = f"""
-        Review the following subtitle chunk (Lines {i} to {i+len(chunk)}).
-        You have access to the VIDEO and AUXILIARY FILES.
-        
-        Task:
-        1. Check for any mismatches between the text and better visual context (blackboard, slides).
-        2. Ensure strict mathematical terminology consistency.
-        3. OUTPUT: A JSON list of ONLY the lines that need correction. If a line is correct, do not include it.
-        
-        Subtitles:
-        {chunk_text}
-        """
-
-        contents = context_files + [prompt]
-
-        print(f"Reviewing chunk {i}-{i+len(chunk)}...", end="\r")
-        try:
-            response = client.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ChunkReviewResponse,
-                ),
+    futures = []
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        for i in range(0, len(subtitles), CHUNK_SIZE):
+            chunk = subtitles[i : i + CHUNK_SIZE]
+            futures.append(
+                executor.submit(process_chunk_review, i, chunk, context_files, client)
             )
-            data = ChunkReviewResponse.model_validate_json(response.text)
 
-            updates_count = 0
-            for correction in data.corrections:
-                # Find the subtitle with this index (srt index is 1-based usually, but here we iterate list)
-                # Wait, srt.index is the file's index. We should map carefully.
-                # 'chunk' is a slice of objects.
-                # Let's verify index matching.
-                # The prompt received "sub.index: sub.content".
-                # We should look up by srt index.
-                target = next((s for s in chunk if s.index == correction.index), None)
-                if target:
-                    if target.content != correction.content:
-                        target.content = correction.content
-                        updates_count += 1
+        completed = 0
+        all_corrections = []
+        for future in as_completed(futures):
+            result = future.result()
+            all_corrections.extend(result)
+            completed += 1
+            print(f"  Processed {completed}/{len(futures)} chunks...", end="\r")
 
-            if updates_count > 0:
-                print(f"  Chunk {i}: {updates_count} corrections applied.")
+    print("\nApplying corrections...")
 
-        except Exception as e:
-            print(f"  Chunk {i} review failed: {e}")
+    # Map for quick lookup
+    sub_map = {s.index: s for s in subtitles}
 
-    print("\nChunk Review Complete.")
+    updates_count = 0
+    for correction in all_corrections:
+        if correction.index in sub_map:
+            if sub_map[correction.index].content != correction.content:
+                sub_map[correction.index].content = correction.content
+                updates_count += 1
+
+    print(f"Chunk Review Complete. {updates_count} corrections applied.")
     return subtitles
 
 
@@ -442,9 +456,15 @@ def process_subtitles(srt_path: str) -> str:
     global_summary, context_files = prepare_gemini_context(srt_path, client)
 
     # 1. Flash Refinement
-    flash_path, refined_subtitles = ai_refine_subtitles(
-        srt_path, global_summary, context_files, client
-    )
+    flash_path = os.path.splitext(srt_path)[0] + "_flash.srt"
+    if os.path.exists(flash_path):
+        print(f"Found existing Flash refinement: {flash_path}. Skipping Pass 1.")
+        with open(flash_path, "r", encoding="utf-8") as f:
+            refined_subtitles = list(srt.parse(f.read()))
+    else:
+        flash_path, refined_subtitles = ai_refine_subtitles(
+            srt_path, global_summary, context_files, client
+        )
 
     # 2. Pro Chunk Review (using result from Pass 1)
     reviewed_subtitles = ai_review_chunks(refined_subtitles, context_files, client)
